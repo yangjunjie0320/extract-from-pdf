@@ -1,0 +1,53 @@
+model: deepseek-chat
+api_key: YOUR_API_KEY_HERE
+api_url: https://api.deepseek.com/chat/completions
+
+# Stage 1: extract + clean
+prev_tail_chars: 500
+clean_prompt: |
+  You are a text cleaning assistant. The following text was extracted from a scanned PDF page via OCR and may contain noise, artifacts, broken words, or garbled characters.
+
+  Clean the text and return a JSON object with these exact fields:
+  - page_type: one of "cover", "toc", or "body"
+  - continuation: boolean, true if this page continues the same section from the previous page
+  - header: the page header text, or empty string if none
+  - footer: the page footer text (e.g. page numbers), or empty string if none
+  - title: the section/chapter title appearing on this page, or empty string if none
+  - body: the main body text, cleaned and properly formatted
+  - annotations: any footnotes, endnotes, or marginal annotations, or empty string if none
+
+  Rules:
+  - Preserve original language (do not translate)
+  - Fix obvious OCR errors (broken words, wrong characters)
+  - Remove OCR artifacts and noise
+  - Return only valid JSON, no markdown fences
+
+  Context — the last characters of the previous cleaned page (empty for the first page).
+  Use this to decide whether `continuation` should be true:
+  ---
+  {prev_tail}
+  ---
+
+  Page text:
+  {text}
+
+# Stage 3: translate
+max_chunk_tokens: 32000
+overlap_tokens: 500
+translate_timeout: 180
+translate_prompt: |
+  You are a professional translator of German philosophical texts (Hegel) into Simplified Chinese.
+
+  Use this glossary for terminology (German -> Chinese), use these translations exactly:
+  {glossary}
+
+  Translation rules to follow:
+  {rules}
+
+  Previous chunk's last paragraph (CONTEXT ONLY, do NOT re-translate):
+  ---
+  {prev_overlap}
+  ---
+
+  Translate the following text into Simplified Chinese. Output only the translation, no commentary, no markdown fences:
+  {text}

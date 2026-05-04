@@ -1,0 +1,17 @@
+# 敏感
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# 项目运行时输出
+output/
+
+# 系统
+.DS_Store
