@@ -1,6 +1,7 @@
 model: deepseek-chat
 api_key: YOUR_API_KEY_HERE
 api_url: https://api.deepseek.com/chat/completions
+max_tokens: 8192
 
 # Stage 1: extract + clean
 prev_tail_chars: 500

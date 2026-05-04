@@ -9,11 +9,13 @@ def call_api(
     timeout: int,
     max_retries: int = 3,
     response_format: dict | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     payload: dict = {
         "model": config["model"],
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
+        "max_tokens": max_tokens or config.get("max_tokens", 8192),
     }
     if response_format:
         payload["response_format"] = response_format
