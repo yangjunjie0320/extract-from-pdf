@@ -5,8 +5,10 @@ from pathlib import Path
 
 import yaml
 
-from cleaner import clean_pages
-from extractor import extract_pages
+from src.cleaner import clean_pages
+from src.extractor import extract_pages
+from src.merger import merge_to_markdown
+from src.translator import translate_markdown
 
 
 def load_config(config_path: str) -> dict:
@@ -29,7 +31,7 @@ def load_config(config_path: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract and clean text from a scanned PDF using an LLM."
+        description="Extract, clean, merge, and translate text from a scanned PDF."
     )
     parser.add_argument("pdf", help="Path to the input PDF file")
     parser.add_argument("output_dir", help="Directory to write output files")
@@ -39,14 +41,30 @@ def main() -> None:
         help="Path to config.yaml (default: config.yaml)",
     )
     parser.add_argument(
+        "--stage",
+        choices=["extract", "merge", "translate", "all"],
+        default="all",
+        help="Which stage(s) to run (default: all)",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=60,
-        help="API request timeout in seconds (default: 60)",
+        help="API request timeout in seconds for extract stage (default: 60)",
     )
     parser.add_argument(
         "--pages",
-        help="Page range to process, e.g. 1-10 or 5 (default: all pages)",
+        help="Page range to process in extract stage, e.g. 1-10 or 5 (default: all)",
+    )
+    parser.add_argument(
+        "--glossary",
+        default=None,
+        help="Path to glossary CSV file (used in translate stage)",
+    )
+    parser.add_argument(
+        "--rules",
+        default=None,
+        help="Path to translation rules TXT file (used in translate stage)",
     )
     args = parser.parse_args()
 
@@ -59,28 +77,84 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Extracting pages from {args.pdf}...")
-    try:
-        pages = extract_pages(args.pdf)
-    except Exception as e:
-        print(f"Failed to open PDF: {e}", file=sys.stderr)
-        sys.exit(1)
+    cleaned_path = output_dir / "cleaned.json"
+    content_path = output_dir / "content.md"
+    translated_path = output_dir / "translated.md"
 
-    if args.pages:
-        pages = _filter_pages(pages, args.pages)
+    run_extract = args.stage in ("extract", "all")
+    run_merge = args.stage in ("merge", "all")
+    run_translate = args.stage in ("translate", "all")
 
-    print(f"Cleaning {len(pages)} pages with {config['model']}...")
-    try:
-        cleaned = clean_pages(pages, config, timeout=args.timeout)
-    except RuntimeError as e:
-        print(f"Cleaning failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    if run_extract:
+        print(f"Extracting pages from {args.pdf}...")
+        try:
+            pages = extract_pages(args.pdf)
+        except Exception as e:
+            print(f"Failed to open PDF: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    out_path = output_dir / "cleaned.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+        if args.pages:
+            pages = _filter_pages(pages, args.pages)
 
-    print(f"Done. Written {len(cleaned)} pages to {out_path}")
+        print(f"Cleaning {len(pages)} pages with {config['model']}...")
+        try:
+            cleaned = clean_pages(pages, config, timeout=args.timeout)
+        except RuntimeError as e:
+            print(f"Cleaning failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(cleaned_path, "w", encoding="utf-8") as f:
+            json.dump(cleaned, f, ensure_ascii=False, indent=2)
+        print(f"Extract done. Written {len(cleaned)} pages to {cleaned_path}")
+
+    if run_merge:
+        if not cleaned_path.exists():
+            print(
+                f"Error: {cleaned_path} not found.\nRun with --stage extract first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        with open(cleaned_path, encoding="utf-8") as f:
+            cleaned = json.load(f)
+
+        print(f"Merging {len(cleaned)} pages into Markdown...")
+        merge_to_markdown(cleaned, content_path)
+        print(f"Merge done. Written to {content_path}")
+
+    if run_translate:
+        if not content_path.exists():
+            print(
+                f"Error: {content_path} not found.\nRun with --stage merge first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "translate_prompt" not in config:
+            print(
+                "Error: translate_prompt not found in config.yaml.\n"
+                "See config.example.yaml for the required fields.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        translate_timeout: int = config.get("translate_timeout", args.timeout)
+        glossary_path = Path(args.glossary) if args.glossary else None
+        rules_path = Path(args.rules) if args.rules else None
+
+        print("Translating...")
+        try:
+            translate_markdown(
+                content_path,
+                translated_path,
+                config,
+                glossary_path=glossary_path,
+                rules_path=rules_path,
+                timeout=translate_timeout,
+            )
+        except RuntimeError as e:
+            print(f"Translation failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Translate done. Written to {translated_path}")
 
 
 def _filter_pages(pages: list[dict], spec: str) -> list[dict]:
