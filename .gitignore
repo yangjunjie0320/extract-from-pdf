@@ -9,9 +9,11 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 
 # 项目运行时输出
 output/
+*.log
 
 # 系统
 .DS_Store

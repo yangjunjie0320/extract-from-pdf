@@ -1,8 +1,12 @@
+import concurrent.futures
 import csv
+import logging
 import re
 from pathlib import Path
 
-from src.llm import call_api
+from src.llm_client import call_api
+
+logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 2
 
@@ -27,20 +31,18 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // _CHARS_PER_TOKEN
 
 
-def _split_into_chunks(body: str, max_tokens: int, overlap_tokens: int) -> list[str]:
+def _split_into_chunks(body: str, max_tokens: int) -> list[str]:
     paragraphs = re.split(r"\n{2,}", body)
     chunks: list[str] = []
     current_parts: list[str] = []
     current_tokens = 0
-    overlap_chars = overlap_tokens * _CHARS_PER_TOKEN
 
     for para in paragraphs:
         para_tokens = _estimate_tokens(para)
         if current_tokens + para_tokens > max_tokens and current_parts:
             chunks.append("\n\n".join(current_parts))
-            overlap_text = "\n\n".join(current_parts)[-overlap_chars:]
-            current_parts = [overlap_text, para] if overlap_text else [para]
-            current_tokens = _estimate_tokens("\n\n".join(current_parts))
+            current_parts = [para]
+            current_tokens = para_tokens
         else:
             current_parts.append(para)
             current_tokens += para_tokens
@@ -51,93 +53,109 @@ def _split_into_chunks(body: str, max_tokens: int, overlap_tokens: int) -> list[
     return chunks if chunks else [body]
 
 
-def _translate_chunk(
+def _translate_chunk_worker(
+    chunk_id: str,
     text: str,
-    prev_overlap: str,
     glossary: str,
     rules: str,
-    config: dict,
-    timeout: int,
+    prompt_template: str,
+    cfg: dict,
+    cache_dir: Path,
 ) -> str:
-    prompt = config["translate_prompt"].format(
+    cache_path = cache_dir / f"{chunk_id}.md"
+    try:
+        return cache_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+
+    logger.info("Translating %s...", chunk_id)
+    prompt = prompt_template.format(
         glossary=glossary,
         rules=rules,
-        prev_overlap=prev_overlap,
         text=text,
     )
-    return call_api(prompt, config, timeout=timeout)
+
+    log_path = cache_dir / "logs" / f"{chunk_id}.json"
+    translated = call_api(
+        prompt,
+        model=cfg["translation"]["model"],
+        api_config=cfg["api"],
+        log_path=log_path,
+    ).strip()
+    cache_path.write_text(translated, encoding="utf-8")
+    return translated
 
 
 def translate_markdown(
     content_path: Path,
     output_path: Path,
-    config: dict,
-    glossary_path: Path | None,
-    rules_path: Path | None,
-    timeout: int = 180,
+    cfg: dict,
+    prompt_template: str,
 ) -> None:
-    glossary = _load_glossary(glossary_path) if glossary_path else ""
-    rules = _load_rules(rules_path) if rules_path else ""
-    max_chunk_tokens: int = config.get("max_chunk_tokens", 32000)
-    overlap_tokens: int = config.get("overlap_tokens", 500)
+    trans_cfg: dict = cfg.get("translation", {})
+
+    glossary_path_str = trans_cfg.get("glossary")
+    glossary_path = Path(glossary_path_str) if glossary_path_str else None
+    rules_path_str = trans_cfg.get("rules")
+    rules_path = Path(rules_path_str) if rules_path_str else None
+
+    glossary = (
+        _load_glossary(glossary_path)
+        if glossary_path and glossary_path.exists()
+        else ""
+    )
+    rules = _load_rules(rules_path) if rules_path and rules_path.exists() else ""
+
+    max_chunk_tokens: int = trans_cfg.get("max_tokens", 120000)
+    max_workers: int = cfg.get("runtime", {}).get("workers", 4)
+
+    cache_dir = output_path.parent / "cache_trans"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     content = content_path.read_text(encoding="utf-8")
-    raw_sections = re.split(r"(?=^## )", content, flags=re.MULTILINE)
 
-    translated_sections: list[str] = []
-    total = len(raw_sections)
+    if _estimate_tokens(content) <= max_chunk_tokens:
+        chunks = [content]
+    else:
+        chunks = _split_into_chunks(content, max_chunk_tokens)
 
-    for i, section in enumerate(raw_sections):
-        if not section.strip():
-            continue
+    logger.info(
+        "Submitting %d translation chunks with %d workers...", len(chunks), max_workers
+    )
 
-        title_match = re.match(r"^## (.+)\n", section)
-        if title_match:
-            de_title = title_match.group(1)
-            body = section[title_match.end() :]
-            print(f"Translating section {i + 1}/{total}: {de_title[:60]}...")
-            zh_title = _translate_chunk(
-                de_title, "", glossary, rules, config, timeout
-            ).strip()
-        else:
-            body = section
-            zh_title = ""
-            print(f"Translating section {i + 1}/{total} (no title)...")
+    tasks = []
+    for j, chunk in enumerate(chunks):
+        tasks.append(
+            {
+                "chunk_id": f"chunk_{j:04d}",
+                "text": chunk,
+            }
+        )
 
-        body = body.strip()
-        if not body:
-            if zh_title:
-                translated_sections.append(f"## {zh_title}\n")
-            continue
+    results: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _translate_chunk_worker,
+                t["chunk_id"],
+                t["text"],
+                glossary,
+                rules,
+                prompt_template,
+                cfg,
+                cache_dir,
+            ): t["chunk_id"]
+            for t in tasks
+        }
+        for future in concurrent.futures.as_completed(futures):
+            chunk_id = futures[future]
+            try:
+                results[chunk_id] = future.result()
+            except Exception as e:
+                logger.error("Translation failed for %s: %s", chunk_id, e)
+                raise
 
-        if _estimate_tokens(body) <= max_chunk_tokens:
-            translated_body = _translate_chunk(
-                body, "", glossary, rules, config, timeout
-            )
-            result = ""
-            if zh_title:
-                result += f"## {zh_title}\n\n"
-            result += translated_body.strip()
-            translated_sections.append(result)
-        else:
-            chunks = _split_into_chunks(body, max_chunk_tokens, overlap_tokens)
-            parts: list[str] = []
-            prev_overlap = ""
-            for j, chunk in enumerate(chunks):
-                print(f"  chunk {j + 1}/{len(chunks)}...")
-                translated = _translate_chunk(
-                    chunk, prev_overlap, glossary, rules, config, timeout
-                )
-                parts.append(translated.strip())
-                overlap_chars = overlap_tokens * _CHARS_PER_TOKEN
-                prev_overlap = chunk[-overlap_chars:]
-
-            result = ""
-            if zh_title:
-                result += f"## {zh_title}\n\n"
-            result += "\n\n".join(parts)
-            translated_sections.append(result)
-
+    ordered = [results[t["chunk_id"]] for t in tasks]
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(translated_sections))
+        f.write("\n\n".join(ordered))
         f.write("\n")
