@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from src.llm_client import call_api
-from src.schema import CleanedBatch, CleanedPage, RawElements
+from src.schema import CleanedBatch, CleanedPage
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def _build_batch_text(layout_dir: Path, page_numbers: list[int]) -> str:
     return "\n\n".join(parts)
 
 
-def _clean_batch_worker(
+def _call_llm_for_batch(
     batch_pages: list[int],
     layout_dir: Path,
     cleaned_dir: Path,
@@ -49,30 +49,18 @@ def _clean_batch_worker(
     all_page_numbers: list[int],
     cfg: dict,
     doc_stats: str,
-) -> CleanedBatch:
+) -> tuple[list[CleanedPage], set[int]]:
+    """Call LLM for a batch, return (pages, missing_pages)."""
     first = batch_pages[0]
     last = batch_pages[-1]
     batch_id = f"{first:03d}-{last:03d}"
-    out_path = cleaned_dir / f"batch_{batch_id}.json"
-
-    try:
-        with open(out_path, encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass  # corrupt file, re-clean
-
-    logger.info("Cleaning batch %s (%d pages)...", batch_id, len(batch_pages))
 
     batch_text = _build_batch_text(layout_dir, batch_pages)
 
     idx_first = all_page_numbers.index(first)
     idx_last = all_page_numbers.index(last)
-
     prev_pages = all_page_numbers[max(0, idx_first - context_pages) : idx_first]
     next_pages = all_page_numbers[idx_last + 1 : idx_last + 1 + context_pages]
-
     prev_context = _build_batch_text(layout_dir, prev_pages) if prev_pages else ""
     next_context = _build_batch_text(layout_dir, next_pages) if next_pages else ""
 
@@ -99,10 +87,10 @@ def _clean_batch_worker(
                 log_path=log_path,
             )
             raw = _parse_json(content)
-            break
+            return _normalize_pages(raw, batch_pages)
         except ValueError as e:
             last_error = e
-            wait = 5 * (2**attempt)  # 5s, 10s, 20s — longer gap for rate-limit recovery
+            wait = 5 * (2**attempt)
             logger.warning(
                 "  [batch %s] JSON parse failed on attempt %d, retrying in %ds... (%s)",
                 batch_id,
@@ -113,13 +101,81 @@ def _clean_batch_worker(
             time.sleep(wait)
         except RuntimeError:
             raise
-    else:
-        raise RuntimeError(
-            f"Failed to get valid JSON after {max_retries} attempts for batch {batch_id}: {last_error}\n"
-            "Try reducing cleaning.batch_size in config.yaml."
-        )
+    raise RuntimeError(
+        f"Failed to get valid JSON after {max_retries} attempts for batch {batch_id}: {last_error}\n"
+        "Try reducing cleaning.batch_size in config.yaml."
+    )
 
-    pages: list[CleanedPage] = _normalize_pages(raw, batch_pages)
+
+def _clean_batch_worker(
+    batch_pages: list[int],
+    layout_dir: Path,
+    cleaned_dir: Path,
+    prompt_template: str,
+    context_pages: int,
+    all_page_numbers: list[int],
+    cfg: dict,
+    doc_stats: str,
+) -> CleanedBatch:
+    first = batch_pages[0]
+    last = batch_pages[-1]
+    batch_id = f"{first:03d}-{last:03d}"
+    out_path = cleaned_dir / f"batch_{batch_id}.json"
+
+    try:
+        with open(out_path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass  # corrupt file, re-clean
+
+    logger.info("Cleaning batch %s (%d pages)...", batch_id, len(batch_pages))
+
+    pages, missing = _call_llm_for_batch(
+        batch_pages,
+        layout_dir,
+        cleaned_dir,
+        prompt_template,
+        context_pages,
+        all_page_numbers,
+        cfg,
+        doc_stats,
+    )
+
+    # If LLM truncated output, split into halves and retry each half separately
+    if missing and len(batch_pages) > 1:
+        logger.warning(
+            "  [batch %s] LLM returned only %d/%d pages, splitting and retrying...",
+            batch_id,
+            len(batch_pages) - len(missing),
+            len(batch_pages),
+        )
+        mid = len(batch_pages) // 2
+        halves = [batch_pages[:mid], batch_pages[mid:]]
+        pages_by_num: dict[int, CleanedPage] = {}
+        for half in halves:
+            half_pages, half_missing = _call_llm_for_batch(
+                half,
+                layout_dir,
+                cleaned_dir,
+                prompt_template,
+                context_pages,
+                all_page_numbers,
+                cfg,
+                doc_stats,
+            )
+            if half_missing:
+                logger.warning(
+                    "  [batch %s] still missing %d page(s) after split: %s",
+                    batch_id,
+                    len(half_missing),
+                    sorted(half_missing),
+                )
+            for p in half_pages:
+                pages_by_num[p["page"]] = p
+        pages = [pages_by_num[n] for n in batch_pages]
+
     result: CleanedBatch = {"batch_id": batch_id, "pages": pages}
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -128,20 +184,10 @@ def _clean_batch_worker(
     return result
 
 
-def _normalize_raw(item: dict) -> RawElements:
-    """Extract and normalize the raw element classification from LLM output."""
-    raw_data = item.get("raw", {})
-    if not isinstance(raw_data, dict):
-        raw_data = {}
-    return RawElements(
-        header=raw_data.get("header", ""),
-        footer=raw_data.get("footer", ""),
-        body=raw_data.get("body", ""),
-        footnotes=raw_data.get("footnotes", []),
-    )
-
-
-def _normalize_pages(raw: list | dict, batch_pages: list[int]) -> list[CleanedPage]:
+def _normalize_pages(
+    raw: list | dict, batch_pages: list[int]
+) -> tuple[list[CleanedPage], set[int]]:
+    """Return (pages, missing_page_numbers). missing is non-empty when LLM truncated output."""
     if isinstance(raw, dict):
         candidates = [v for v in raw.values() if isinstance(v, list)]
         raw = candidates[0] if candidates else [raw]
@@ -154,22 +200,22 @@ def _normalize_pages(raw: list | dict, batch_pages: list[int]) -> list[CleanedPa
                 items_by_page[p] = item
 
     pages: list[CleanedPage] = []
+    missing: set[int] = set()
     for page_num in batch_pages:
         item = items_by_page.get(page_num)
         if item is None:
-            logger.warning("no result for page %d, inserting empty stub", page_num)
+            missing.add(page_num)
             item = {}
         pages.append(
             CleanedPage(
                 page=page_num,
                 page_type=item.get("page_type", "body"),
                 book_page=item.get("book_page") or None,
-                raw=_normalize_raw(item),
                 body_md=item.get("body_md", ""),
                 warnings=item.get("warnings", []),
             )
         )
-    return pages
+    return pages, missing
 
 
 def clean_pages(
