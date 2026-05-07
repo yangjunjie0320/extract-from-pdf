@@ -10,8 +10,12 @@ _CONTENT_PATTERN = re.compile(
     re.DOTALL,
 )
 
-# Metadata lines injected by Cleaner, e.g. `Original Name: Foo, Position: Page 3`
-_METADATA_LINE = re.compile(r"^`Original Name:.*`$", re.MULTILINE)
+# `Original Name: Foo, Position: Page 3`
+_METADATA_WITH_PAGE = re.compile(
+    r"^`Original Name:[^`]+,\s*Position:\s*Page\s*([^`\s]+)`$", re.MULTILINE
+)
+# `Original Name: Foo`  (no page)
+_METADATA_NO_PAGE = re.compile(r"^`Original Name:[^`]+`$", re.MULTILINE)
 
 
 def write_latex(
@@ -28,7 +32,10 @@ def write_latex(
         )
 
     md = translated_path.read_text(encoding="utf-8")
-    md = _METADATA_LINE.sub("", md)
+    md = _METADATA_WITH_PAGE.sub(
+        lambda m: f"\\noindent{{\\small（原书第 {m.group(1)} 页）}}\n", md
+    )
+    md = _METADATA_NO_PAGE.sub("", md)
 
     try:
         result = subprocess.run(
