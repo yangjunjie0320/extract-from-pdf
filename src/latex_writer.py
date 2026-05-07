@@ -10,6 +10,9 @@ _CONTENT_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# Metadata lines injected by Cleaner, e.g. `Original Name: Foo, Position: Page 3`
+_METADATA_LINE = re.compile(r"^`Original Name:.*`$", re.MULTILINE)
+
 
 def write_latex(
     translated_path: Path,
@@ -24,9 +27,13 @@ def write_latex(
             "Check latex.template in config.yaml."
         )
 
+    md = translated_path.read_text(encoding="utf-8")
+    md = _METADATA_LINE.sub("", md)
+
     try:
         result = subprocess.run(
-            ["pandoc", "-f", "markdown", "-t", "latex", str(translated_path)],
+            ["pandoc", "-f", "markdown", "-t", "latex", "--wrap=none"],
+            input=md,
             capture_output=True,
             text=True,
             timeout=120,
