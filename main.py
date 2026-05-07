@@ -6,12 +6,13 @@ from pathlib import Path
 from src.cleaner import clean_pages
 from src.config import load_config
 from src.extractor import compute_doc_stats, extract_to_layout
+from src.latex_writer import write_latex
 from src.merger import merge_to_markdown
 from src.translator import translate_markdown
 
 logger = logging.getLogger(__name__)
 
-_STAGES = ("extract", "clean", "merge", "translate")
+_STAGES = ("extract", "clean", "merge", "translate", "latex")
 
 
 def _parse_pages(spec: str) -> tuple[int, int]:
@@ -75,10 +76,12 @@ def main() -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    book_name = Path(args.pdf).stem
     layout_dir = output_dir / "layout"
     cleaned_dir = output_dir / "cleaned"
     content_path = output_dir / "content.md"
-    translated_path = output_dir / "translated.md"
+    translated_path = output_dir / f"{book_name}.md"
+    latex_path = output_dir / f"{book_name}.tex"
 
     pages_filter: tuple[int, int] | None = None
     if args.pages:
@@ -110,6 +113,8 @@ def main() -> None:
             return not content_path.exists()
         if stage == "translate":
             return not translated_path.exists()
+        if stage == "latex":
+            return not latex_path.exists()
         return True
 
     def _read_prompt(section: str, key: str = "prompt") -> str:
@@ -216,6 +221,28 @@ def main() -> None:
         logger.info("Translate done. Written to %s", translated_path)
     else:
         logger.info("Skipping translate. Using existing %s", translated_path)
+
+    # Stage 5: LaTeX
+    if should_run("latex"):
+        tmpl = cfg.get("latex", {}).get("template")
+        if not tmpl:
+            logger.info("Skipping latex (no latex.template in config).")
+        else:
+            if not translated_path.exists():
+                logger.error(
+                    "Error: %s not found.\nRun the translate stage first.",
+                    translated_path,
+                )
+                sys.exit(1)
+            logger.info("Generating LaTeX from %s...", translated_path)
+            try:
+                write_latex(translated_path, latex_path, cfg)
+            except RuntimeError as e:
+                logger.error("LaTeX generation failed: %s", e)
+                sys.exit(1)
+            logger.info("LaTeX done. Written to %s", latex_path)
+    else:
+        logger.info("Skipping latex. Using existing %s", latex_path)
 
 
 if __name__ == "__main__":

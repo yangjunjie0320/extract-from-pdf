@@ -21,3 +21,6 @@ translation:
   glossary: ./glossary.csv
   rules: ./rules.txt
   max_tokens: 120000
+
+latex:
+  template: ./book.tex             # 可选；未设置则跳过 latex 阶段
